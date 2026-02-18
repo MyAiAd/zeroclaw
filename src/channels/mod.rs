@@ -80,6 +80,10 @@ struct ChannelRuntimeContext {
     auto_save_memory: bool,
     /// MCP manager for channel tool dispatch; None in tests or when MCP is disabled.
     mcp_manager: Option<Arc<Mutex<McpManager>>>,
+    /// Loaded skills (refreshable via /skill refresh command)
+    skills: Arc<Mutex<Vec<crate::skills::Skill>>>,
+    /// Workspace directory for skill reloading
+    workspace_dir: Arc<PathBuf>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -266,6 +270,183 @@ async fn handle_model_command(
     ))
 }
 
+/// Skill command result — either a response message or a refresh action
+enum SkillCommandResult {
+    /// Send this response to the user
+    Response(String),
+    /// Refresh skills and send this response
+    Refresh(String),
+}
+
+/// Handle /skills and /skill commands (US-028)
+///
+/// Commands:
+/// - `/skills` - list all available skills
+/// - `/skill info <name>` - show detailed info about a skill
+/// - `/skill refresh` - reload skills from disk
+///
+/// Returns Some(result) if this was a skill command, None otherwise.
+fn handle_skill_command(
+    message: &str,
+    skills: &[crate::skills::Skill],
+) -> Option<SkillCommandResult> {
+    let trimmed = message.trim();
+
+    // /skills - list all skills
+    if trimmed.starts_with("/skills") {
+        let after_command = trimmed
+            .strip_prefix("/skills")
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("")
+            .trim();
+
+        // /skills or /skills list
+        if after_command.is_empty() || after_command.eq_ignore_ascii_case("list") {
+            if skills.is_empty() {
+                return Some(SkillCommandResult::Response(
+                    "🧩 *No skills installed*\n\n\
+                     Install skills via CLI:\n\
+                     `zeroclaw skills install <github-url>`\n\n\
+                     Or create one:\n\
+                     `mkdir -p ~/.zeroclaw/workspace/skills/my-skill`\n\
+                     `echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md`"
+                        .to_string(),
+                ));
+            }
+
+            let mut response = format!("🧩 *Available Skills* ({})\n\n", skills.len());
+            for skill in skills {
+                response.push_str(&format!(
+                    "• **{}** v{}\n  _{}_\n",
+                    skill.name, skill.version, skill.description
+                ));
+            }
+            response.push_str("\nUse `/skill info <name>` for details.");
+            return Some(SkillCommandResult::Response(response));
+        }
+
+        return None;
+    }
+
+    // /skill <subcommand>
+    if trimmed.starts_with("/skill") && !trimmed.starts_with("/skills") {
+        // Handle bot suffix: /skill@botname info test → info test
+        let remainder = trimmed.strip_prefix("/skill").unwrap_or("");
+        let after_command = if remainder.starts_with('@') {
+            // Skip @botname part (everything until first space)
+            remainder
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("")
+        } else {
+            remainder.trim()
+        };
+
+        if after_command.is_empty() {
+            return Some(SkillCommandResult::Response(
+                "❌ Usage:\n\
+                 • `/skills` - list all skills\n\
+                 • `/skill info <name>` - show skill details\n\
+                 • `/skill refresh` - reload skills from disk"
+                    .to_string(),
+            ));
+        }
+
+        let parts: Vec<&str> = after_command.split_whitespace().collect();
+
+        // /skill refresh
+        if parts[0].eq_ignore_ascii_case("refresh") || parts[0].eq_ignore_ascii_case("reload") {
+            return Some(SkillCommandResult::Refresh(
+                "🔄 Skills refreshed from disk.".to_string(),
+            ));
+        }
+
+        // /skill info <name>
+        if parts[0].eq_ignore_ascii_case("info") || parts[0].eq_ignore_ascii_case("show") {
+            if parts.len() < 2 {
+                return Some(SkillCommandResult::Response(
+                    "❌ Usage: `/skill info <name>`".to_string(),
+                ));
+            }
+
+            let name = parts[1].to_lowercase();
+            let skill = skills.iter().find(|s| s.name.to_lowercase() == name);
+
+            return Some(SkillCommandResult::Response(match skill {
+                Some(s) => {
+                    let mut info = format!(
+                        "🧩 *{}* v{}\n\n\
+                         _{}_\n\n",
+                        s.name, s.version, s.description
+                    );
+
+                    if let Some(author) = &s.author {
+                        info.push_str(&format!("**Author:** {}\n", author));
+                    }
+
+                    if !s.tags.is_empty() {
+                        info.push_str(&format!("**Tags:** {}\n", s.tags.join(", ")));
+                    }
+
+                    if !s.tools.is_empty() {
+                        info.push_str("\n**Tools:**\n");
+                        for tool in &s.tools {
+                            info.push_str(&format!(
+                                "• `{}` ({}) - {}\n",
+                                tool.name, tool.kind, tool.description
+                            ));
+                        }
+                    }
+
+                    if let Some(loc) = &s.location {
+                        info.push_str(&format!("\n**Path:** `{}`", loc.display()));
+                    }
+
+                    info
+                }
+                None => {
+                    let available = skills
+                        .iter()
+                        .map(|s| s.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "❌ Skill '{}' not found.\n\n**Available:** {}",
+                        parts[1], available
+                    )
+                }
+            }));
+        }
+
+        // Unknown subcommand - treat as skill name lookup (shorthand for /skill info <name>)
+        let name = parts[0].to_lowercase();
+        let skill = skills.iter().find(|s| s.name.to_lowercase() == name);
+
+        if let Some(s) = skill {
+            let mut info = format!(
+                "🧩 *{}* v{}\n\n_{}_",
+                s.name, s.version, s.description
+            );
+            if !s.tools.is_empty() {
+                info.push_str(&format!("\n\n**Tools:** {}", s.tools.len()));
+            }
+            return Some(SkillCommandResult::Response(info));
+        }
+
+        return Some(SkillCommandResult::Response(
+            "❌ Usage:\n\
+             • `/skills` - list all skills\n\
+             • `/skill info <name>` - show skill details\n\
+             • `/skill refresh` - reload skills from disk"
+                .to_string(),
+        ));
+    }
+
+    None
+}
+
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
@@ -387,6 +568,37 @@ async fn process_channel_message_inner(
             }
         }
         return;
+    }
+
+    // ── /skills and /skill command handling (US-028) ─────────────────
+    {
+        let skills_guard = ctx.skills.lock().await;
+        if let Some(result) = handle_skill_command(&msg.content, &skills_guard) {
+            drop(skills_guard); // Release lock before async operations
+
+            let response = match result {
+                SkillCommandResult::Response(msg) => msg,
+                SkillCommandResult::Refresh(msg) => {
+                    // Reload skills from disk
+                    let new_skills = crate::skills::load_skills(&ctx.workspace_dir);
+                    let count = new_skills.len();
+                    let mut skills_guard = ctx.skills.lock().await;
+                    *skills_guard = new_skills;
+                    drop(skills_guard);
+                    format!("{} ({} skills loaded)", msg, count)
+                }
+            };
+
+            if let Some(channel) = target_channel.as_ref() {
+                if let Err(e) = channel
+                    .send(&SendMessage::new(&response, &msg.reply_target))
+                    .await
+                {
+                    eprintln!("  ❌ Failed to send /skill response: {e}");
+                }
+            }
+            return;
+        }
     }
 
     // ── Model switch detection (US-015) ─────────────────────────────
@@ -1638,6 +1850,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         temperature,
         auto_save_memory: config.memory.auto_save,
         mcp_manager: Some(Arc::clone(&mcp_manager)),
+        skills: Arc::new(Mutex::new(skills)),
+        workspace_dir: Arc::new(workspace.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1867,6 +2081,8 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             mcp_manager: None,
+            skills: Arc::new(Mutex::new(Vec::new())),
+            workspace_dir: Arc::new(PathBuf::from("/tmp")),
         });
 
         process_channel_message(
@@ -1909,6 +2125,8 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             mcp_manager: None,
+            skills: Arc::new(Mutex::new(Vec::new())),
+            workspace_dir: Arc::new(PathBuf::from("/tmp")),
         });
 
         process_channel_message(
@@ -2005,6 +2223,8 @@ mod tests {
             temperature: 0.0,
             auto_save_memory: false,
             mcp_manager: None,
+            skills: Arc::new(Mutex::new(Vec::new())),
+            workspace_dir: Arc::new(PathBuf::from("/tmp")),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2597,5 +2817,152 @@ mod tests {
             .unwrap_or("")
             .contains("listen boom"));
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    // ── Skill command tests (US-028) ─────────────────────────────────
+
+    #[test]
+    fn skill_command_list_empty() {
+        let result = handle_skill_command("/skills", &[]);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if msg.contains("No skills installed")));
+    }
+
+    #[test]
+    fn skill_command_list_with_skills() {
+        let skills = vec![
+            crate::skills::Skill {
+                name: "web-search".into(),
+                description: "Search the web".into(),
+                version: "1.0.0".into(),
+                author: Some("test".into()),
+                tags: vec!["search".into()],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+            },
+            crate::skills::Skill {
+                name: "code-review".into(),
+                description: "Review code for bugs".into(),
+                version: "2.0.0".into(),
+                author: None,
+                tags: vec![],
+                tools: vec![],
+                prompts: vec![],
+                location: None,
+            },
+        ];
+
+        let result = handle_skill_command("/skills", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if
+            msg.contains("web-search") &&
+            msg.contains("code-review") &&
+            msg.contains("(2)")
+        ));
+    }
+
+    #[test]
+    fn skill_command_info_found() {
+        let skills = vec![crate::skills::Skill {
+            name: "web-search".into(),
+            description: "Search the web".into(),
+            version: "1.0.0".into(),
+            author: Some("test-author".into()),
+            tags: vec!["search".into(), "web".into()],
+            tools: vec![crate::skills::SkillTool {
+                name: "search".into(),
+                description: "Run a search".into(),
+                kind: "http".into(),
+                command: "https://example.com".into(),
+                args: std::collections::HashMap::new(),
+            }],
+            prompts: vec![],
+            location: Some(PathBuf::from("/home/user/.zeroclaw/workspace/skills/web-search/SKILL.md")),
+        }];
+
+        let result = handle_skill_command("/skill info web-search", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if
+            msg.contains("web-search") &&
+            msg.contains("test-author") &&
+            msg.contains("search, web") &&
+            msg.contains("search") &&
+            msg.contains("http")
+        ));
+    }
+
+    #[test]
+    fn skill_command_info_not_found() {
+        let skills = vec![crate::skills::Skill {
+            name: "web-search".into(),
+            description: "Search the web".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }];
+
+        let result = handle_skill_command("/skill info unknown", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if
+            msg.contains("not found") &&
+            msg.contains("web-search")
+        ));
+    }
+
+    #[test]
+    fn skill_command_refresh() {
+        let result = handle_skill_command("/skill refresh", &[]);
+        assert!(matches!(result, Some(SkillCommandResult::Refresh(_))));
+    }
+
+    #[test]
+    fn skill_command_shorthand_lookup() {
+        let skills = vec![crate::skills::Skill {
+            name: "web-search".into(),
+            description: "Search the web".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }];
+
+        // /skill web-search (shorthand for /skill info web-search)
+        let result = handle_skill_command("/skill web-search", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if
+            msg.contains("web-search") &&
+            msg.contains("Search the web")
+        ));
+    }
+
+    #[test]
+    fn skill_command_not_a_skill_command() {
+        let result = handle_skill_command("hello world", &[]);
+        assert!(result.is_none());
+
+        let result = handle_skill_command("/model gpt", &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn skill_command_with_bot_suffix() {
+        let skills = vec![crate::skills::Skill {
+            name: "test".into(),
+            description: "Test skill".into(),
+            version: "1.0.0".into(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            location: None,
+        }];
+
+        // Telegram appends @botname to commands
+        let result = handle_skill_command("/skills@mybot", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if msg.contains("test")));
+
+        let result = handle_skill_command("/skill@mybot info test", &skills);
+        assert!(matches!(result, Some(SkillCommandResult::Response(msg)) if msg.contains("Test skill")));
     }
 }

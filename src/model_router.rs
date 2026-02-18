@@ -55,7 +55,7 @@ static ONE_SHOT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static MAX_TIER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:absolute\s+best|your\s+(?:very\s+)?best|maximum|strongest)\b")
+    Regex::new(r"(?i)\b(?:absolute\s+best|your\s+(?:very\s+)?best|maximum|strongest|highest|most\s+(?:powerful|capable|intelligent|advanced)|top\s+(?:model|tier)|the\s+best\s+(?:model|one))\b")
         .expect("Invalid max tier pattern")
 });
 
@@ -73,7 +73,7 @@ static STRIP_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         Regex::new(r"(?i)\b(?:quick(?:er)?\s+(?:answer|response)|simpler\s+model|cheaper|faster)\s*").unwrap(),
         Regex::new(r"(?i)\b(?:from\s+now\s+on|for\s+(?:the\s+)?rest|going\s+forward)\s*").unwrap(),
         Regex::new(r"(?i)\b(?:just\s+(?:for\s+)?this|only\s+this\s+(?:one|time))\s*").unwrap(),
-        Regex::new(r"(?i)\b(?:your\s+(?:very\s+)?(?:best|smartest|strongest)|absolute\s+best|maximum|strongest)\s*").unwrap(),
+        Regex::new(r"(?i)\b(?:your\s+(?:very\s+)?(?:best|smartest|strongest)|absolute\s+best|maximum|strongest|highest|most\s+(?:powerful|capable|intelligent|advanced)|top\s+(?:model|tier)|the\s+best\s+(?:model|one))\s*").unwrap(),
         Regex::new(r"(?i)\bplease\s+use\s+a?\s*").unwrap(),
         Regex::new(r"(?i)\bcan\s+you\s+(?:use\s*|switch\s+to\s*)").unwrap(),
         Regex::new(r"(?i)\b(?:a\s+)?model\s+from\s+").unwrap(),
@@ -575,5 +575,47 @@ mod tests {
     fn detect_better_model() {
         let result = detect_model_switch_regex("use a better model").unwrap();
         assert_eq!(result.tier, Some(ModelTier::High));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Regression tests: phrases that were previously not detected (Bug B fix)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn detect_highest_model() {
+        let result = detect_model_switch_regex("switch to the highest model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+    }
+
+    #[test]
+    fn detect_most_powerful_model() {
+        let result = detect_model_switch_regex("use your most powerful model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+    }
+
+    #[test]
+    fn detect_most_capable_model() {
+        let result = detect_model_switch_regex("can you switch to the most capable model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+    }
+
+    #[test]
+    fn detect_top_model() {
+        let result = detect_model_switch_regex("please use the top model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+    }
+
+    #[test]
+    fn detect_the_best_model() {
+        let result = detect_model_switch_regex("use the best model for this").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+    }
+
+    #[test]
+    fn detect_highest_defaults_to_anthropic() {
+        // When no provider specified, should default to Anthropic max tier
+        let result = detect_model_switch_regex("switch to the highest model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::Max));
+        assert!(result.provider.is_none()); // provider resolved by caller to Anthropic
     }
 }
