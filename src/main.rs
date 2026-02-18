@@ -55,6 +55,12 @@ mod identity;
 mod integrations;
 mod memory;
 mod migration;
+mod model_router {
+    pub use zeroclaw::model_router::*;
+}
+mod model_tiers {
+    pub use zeroclaw::model_tiers::*;
+}
 mod observability;
 mod onboard;
 mod peripherals;

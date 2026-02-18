@@ -34,6 +34,11 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
+use crate::model_router::{
+    detect_model_switch_regex, extract_clean_message, generate_switch_notification,
+    ModelPreference, SwitchPersistence,
+};
+use crate::model_tiers::{get_model_for_tier, ModelProvider, ModelTier};
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -75,6 +80,183 @@ struct ChannelRuntimeContext {
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.sender, msg.id)
+}
+
+// ── Model preference storage helpers (local to avoid trait mismatch) ────────
+
+/// Build the memory key for a session's model preference
+fn model_pref_key(session_id: &str) -> String {
+    format!("system:model_preference:{}", session_id)
+}
+
+/// Get the current model preference for a session from memory.
+async fn get_model_preference_local(memory: &dyn Memory, session_id: &str) -> Option<ModelPreference> {
+    let key = model_pref_key(session_id);
+    match memory.get(&key).await {
+        Ok(Some(entry)) => serde_json::from_str(&entry.content).ok(),
+        _ => None,
+    }
+}
+
+/// Set the model preference for a session.
+async fn set_model_preference_local(
+    memory: &dyn Memory,
+    session_id: &str,
+    preference: &ModelPreference,
+) -> anyhow::Result<()> {
+    let key = model_pref_key(session_id);
+    let content = serde_json::to_string(preference)?;
+    memory
+        .store(
+            &key,
+            &content,
+            crate::memory::MemoryCategory::Custom("system".to_string()),
+            Some(session_id),
+        )
+        .await
+}
+
+/// Create a new model preference from detection result.
+fn create_model_preference_local(
+    provider: ModelProvider,
+    tier: ModelTier,
+    model_id: &str,
+) -> ModelPreference {
+    ModelPreference {
+        provider: provider.to_string(),
+        model_id: model_id.to_string(),
+        tier: tier.to_string(),
+        set_at: chrono::Utc::now().to_rfc3339(),
+        set_by: "user".to_string(),
+    }
+}
+
+/// Handle /model command for Telegram and similar interfaces (US-016)
+///
+/// Commands:
+/// - `/model` or `/model status` - show current model
+/// - `/model <provider>` - switch to provider's default tier
+/// - `/model <provider> <tier>` - switch to specific provider+tier
+/// - `/model reset` - clear session preference
+///
+/// Returns Some(response) if this was a /model command, None otherwise.
+async fn handle_model_command(
+    message: &str,
+    session_id: &str,
+    memory: &dyn Memory,
+    default_model: &str,
+) -> Option<String> {
+    let trimmed = message.trim();
+
+    // Check if this is a /model command
+    if !trimmed.starts_with("/model") {
+        return None;
+    }
+
+    // Extract command after /model (handle @botname suffix)
+    let after_command = trimmed
+        .strip_prefix("/model")
+        .unwrap_or("")
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    // /model or /model status - show current model
+    if after_command.is_empty() || after_command.eq_ignore_ascii_case("status") {
+        let current = get_model_preference_local(memory, session_id).await;
+        return Some(if let Some(pref) = current {
+            format!(
+                "📊 *Current Model*\n\n\
+                 • Provider: {}\n\
+                 • Model: {}\n\
+                 • Tier: {}\n\
+                 • Set: {}",
+                pref.provider, pref.model_id, pref.tier, pref.set_at
+            )
+        } else {
+            format!(
+                "📊 *Current Model*\n\n\
+                 Using default: {}\n\n\
+                 Use `/model <provider>` to switch (e.g., `/model claude`, `/model gpt high`)",
+                default_model
+            )
+        });
+    }
+
+    // /model reset - clear preference
+    if after_command.eq_ignore_ascii_case("reset") || after_command.eq_ignore_ascii_case("clear") {
+        let key = model_pref_key(session_id);
+        let _ = memory.forget(&key).await;
+        return Some(format!(
+            "✅ Model preference cleared. Now using default: {}",
+            default_model
+        ));
+    }
+
+    // /model <provider> [tier] - switch model
+    let parts: Vec<&str> = after_command.split_whitespace().collect();
+    if parts.is_empty() {
+        return Some("❌ Usage: `/model <provider> [tier]`\n\nProviders: claude, gpt, gemini, deepseek\nTiers: economy, standard, high, max".to_string());
+    }
+
+    // Parse provider
+    let provider = match parts[0].to_lowercase().as_str() {
+        "claude" | "anthropic" => Some(ModelProvider::Anthropic),
+        "gpt" | "openai" | "chatgpt" => Some(ModelProvider::OpenAI),
+        "gemini" | "google" => Some(ModelProvider::Google),
+        "deepseek" => Some(ModelProvider::DeepSeek),
+        _ => None,
+    };
+
+    let Some(provider) = provider else {
+        return Some(format!(
+            "❌ Unknown provider: `{}`\n\nAvailable: claude, gpt, gemini, deepseek",
+            parts[0]
+        ));
+    };
+
+    // Parse tier (default to standard)
+    let tier = if parts.len() > 1 {
+        match parts[1].to_lowercase().as_str() {
+            "economy" | "eco" | "cheap" | "fast" => ModelTier::Economy,
+            "standard" | "std" | "default" | "normal" => ModelTier::Standard,
+            "high" | "hi" | "smart" | "advanced" => ModelTier::High,
+            "max" | "maximum" | "best" | "top" => ModelTier::Max,
+            _ => {
+                return Some(format!(
+                    "❌ Unknown tier: `{}`\n\nAvailable: economy, standard, high, max",
+                    parts[1]
+                ));
+            }
+        }
+    } else {
+        ModelTier::Standard
+    };
+
+    // Look up model for provider+tier
+    let entry = get_model_for_tier(provider, tier);
+    let (model_id, display_name) = match entry {
+        Some(e) => (e.model_id.clone(), e.display_name.clone()),
+        None => {
+            return Some(format!(
+                "❌ {} doesn't have a {} tier model configured",
+                provider, tier
+            ));
+        }
+    };
+
+    // Save preference
+    let pref = create_model_preference_local(provider, tier, &model_id);
+    if let Err(e) = set_model_preference_local(memory, session_id, &pref).await {
+        return Some(format!("❌ Failed to save preference: {e}"));
+    }
+
+    Some(format!(
+        "✅ *Model switched*\n\n\
+         Now using: {} ({} {})",
+        display_name, provider, tier
+    ))
 }
 
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
@@ -157,7 +339,19 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+/// Maximum number of model switch re-runs per message to prevent infinite loops (US-020)
+const MAX_MODEL_SWITCH_RERUNS: u8 = 2;
+
 async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::ChannelMessage) {
+    process_channel_message_inner(ctx, msg, 0).await;
+}
+
+/// Inner message processor that supports re-running on AI-initiated model switches (US-019)
+async fn process_channel_message_inner(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: traits::ChannelMessage,
+    rerun_count: u8,
+) {
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -165,7 +359,95 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         truncate_with_ellipsis(&msg.content, 80)
     );
 
-    let memory_context = build_memory_context(ctx.memory.as_ref(), &msg.content).await;
+    let session_id = format!("{}_{}", msg.channel, msg.sender);
+    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+
+    // ── /model command handling (US-016) ────────────────────────────
+    if let Some(response) = handle_model_command(
+        &msg.content,
+        &session_id,
+        ctx.memory.as_ref(),
+        ctx.model.as_str(),
+    )
+    .await
+    {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(e) = channel
+                .send(&SendMessage::new(&response, &msg.reply_target))
+                .await
+            {
+                eprintln!("  ❌ Failed to send /model response: {e}");
+            }
+        }
+        return;
+    }
+
+    // ── Model switch detection (US-015) ─────────────────────────────
+    let detection = detect_model_switch_regex(&msg.content);
+
+    // Check for existing session preference
+    let session_pref = get_model_preference_local(ctx.memory.as_ref(), &session_id).await;
+
+    // Determine effective model and whether we're switching
+    let (effective_model, notification, is_switch_only, cleaned_message): (
+        String,
+        Option<String>,
+        bool,
+        Option<String>,
+    ) = if let Some(det) = &detection {
+        // User requested a model switch
+        let provider = det.provider.unwrap_or(ModelProvider::Anthropic);
+        let tier = det.tier.unwrap_or(ModelTier::Standard);
+
+        // Look up model for provider+tier
+        let entry = get_model_for_tier(provider, tier);
+        let model_id = entry
+            .map(|e| e.model_id.clone())
+            .unwrap_or_else(|| ctx.model.to_string());
+        let display_name = entry
+            .map(|e| e.display_name.clone())
+            .unwrap_or_else(|| model_id.clone());
+
+        // Check if this is a switch-only command (no actual question)
+        let cleaned = extract_clean_message(&msg.content);
+        let switch_only = cleaned.is_none();
+
+        // Generate notification
+        let notif = generate_switch_notification(&display_name, det.persistence, "user");
+
+        // If sticky, save to memory
+        if det.persistence == SwitchPersistence::Sticky {
+            let pref = create_model_preference_local(provider, tier, &model_id);
+            let _ = set_model_preference_local(ctx.memory.as_ref(), &session_id, &pref).await;
+        }
+
+        (model_id, Some(notif), switch_only, cleaned)
+    } else if let Some(pref) = &session_pref {
+        // Use existing session preference
+        (pref.model_id.clone(), None, false, Some(msg.content.clone()))
+    } else {
+        // Use default model
+        (ctx.model.to_string(), None, false, Some(msg.content.clone()))
+    };
+
+    // Handle switch-only command (no question to answer)
+    if is_switch_only {
+        if let Some(channel) = target_channel.as_ref() {
+            let response = notification.unwrap_or_else(|| "Model preference updated.".to_string());
+            if let Err(e) = channel
+                .send(&SendMessage::new(response.trim(), &msg.reply_target))
+                .await
+            {
+                eprintln!("  ❌ Failed to send switch confirmation: {e}");
+            }
+        }
+        return;
+    }
+
+    // Use cleaned message if we stripped switch commands
+    let message_to_process = cleaned_message.unwrap_or_else(|| msg.content.clone());
+
+    let memory_context = build_memory_context(ctx.memory.as_ref(), &message_to_process).await;
 
     if ctx.auto_save_memory {
         let autosave_key = conversation_memory_key(&msg);
@@ -181,12 +463,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     }
 
     let enriched_message = if memory_context.is_empty() {
-        msg.content.clone()
+        message_to_process.clone()
     } else {
-        format!("{memory_context}{}", msg.content)
+        format!("{memory_context}{}", message_to_process)
     };
-
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
 
     if let Some(channel) = target_channel.as_ref() {
         if let Err(e) = channel.start_typing(&msg.reply_target).await {
@@ -194,7 +474,10 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
         }
     }
 
-    println!("  ⏳ Processing message...");
+    println!(
+        "  ⏳ Processing message (model: {})...",
+        effective_model
+    );
     let started_at = Instant::now();
 
     let mut history = vec![
@@ -214,7 +497,7 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             ctx.tools_registry.as_ref(),
             ctx.observer.as_ref(),
             "channel-runtime",
-            ctx.model.as_str(),
+            &effective_model, // Use the resolved model instead of ctx.model
             ctx.temperature,
             true, // silent — channels don't write to stdout
             None,
@@ -231,14 +514,44 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
 
     match llm_result {
         Ok(Ok(response)) => {
+            // ── AI-initiated model switch detection (US-019) ──────────────
+            // Check if the AI called set_model_preference during this turn
+            if rerun_count < MAX_MODEL_SWITCH_RERUNS {
+                if let Some(new_pref) = get_model_preference_local(ctx.memory.as_ref(), &session_id).await {
+                    // Check if this was set by AI and is different from what we just used
+                    if new_pref.set_by == "ai" && new_pref.model_id != effective_model {
+                        println!(
+                            "  🔄 AI escalated to {} - re-running with new model (rerun {}/{})",
+                            new_pref.model_id,
+                            rerun_count + 1,
+                            MAX_MODEL_SWITCH_RERUNS
+                        );
+                        // Re-run with the new model
+                        return Box::pin(process_channel_message_inner(
+                            ctx,
+                            msg,
+                            rerun_count + 1,
+                        ))
+                        .await;
+                    }
+                }
+            }
+
+            // Prepend model switch notification if applicable
+            let final_response = if let Some(ref notif) = notification {
+                format!("{notif}{response}")
+            } else {
+                response
+            };
+
             println!(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&response, 80)
+                truncate_with_ellipsis(&final_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel
-                    .send(&SendMessage::new(response, &msg.reply_target))
+                    .send(&SendMessage::new(final_response, &msg.reply_target))
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -415,6 +728,30 @@ pub fn build_system_prompt(
          Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
          Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
     );
+
+    // ── 1d. Self-Escalation (US-021) ─────────────────────────────
+    // Only add if set_model_preference tool is available
+    let has_model_preference_tool = tools.iter().any(|(name, _)| *name == "set_model_preference");
+    if has_model_preference_tool {
+        prompt.push_str(
+            "## Model Self-Escalation\n\n\
+             You can request a more powerful model when the task requires it.\n\n\
+             **When to escalate:**\n\
+             - Complex multi-step reasoning or mathematical proofs\n\
+             - Large codebase analysis or architectural decisions\n\
+             - Tasks requiring deep domain expertise\n\
+             - User explicitly asks for your \"best\" or most thorough analysis\n\n\
+             **How to escalate:**\n\
+             Use the `set_model_preference` tool with tier='high' or tier='max':\n\
+             ```\n\
+             <tool_call>\n\
+             {\"name\": \"set_model_preference\", \"arguments\": {\"session_id\": \"<current_session>\", \"tier\": \"high\", \"reason\": \"Complex reasoning task\"}}\n\
+             </tool_call>\n\
+             ```\n\n\
+             **Important:** Only escalate when genuinely needed. Most tasks work well at standard tier. \
+             After escalation, the system may re-run your current request with the more powerful model.\n\n",
+        );
+    }
 
     // ── 2. Safety ───────────────────────────────────────────────
     prompt.push_str("## Safety\n\n");
@@ -1036,6 +1373,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
         (
             "memory_forget",
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
+        ),
+        (
+            "set_model_preference",
+            "Switch to a different AI model. Use when: you realize a task needs more reasoning power (escalate to 'high' or 'max' tier) or when user requests a specific provider. Tiers: economy (fast), standard (default), high (complex reasoning), max (deepest analysis). Providers: anthropic, openai, google, deepseek.",
         ),
     ];
 

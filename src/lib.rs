@@ -54,6 +54,8 @@ pub mod identity;
 pub mod integrations;
 pub mod memory;
 pub mod migration;
+pub mod model_router;
+pub mod model_tiers;
 pub mod observability;
 pub mod onboard;
 pub mod peripherals;

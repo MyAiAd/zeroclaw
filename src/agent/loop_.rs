@@ -923,6 +923,10 @@ pub async fn run(
             "memory_forget",
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
+        (
+            "set_model_preference",
+            "Switch to a different AI model. Use when: you realize a task needs more reasoning power (escalate to 'high' or 'max' tier) or when user requests a specific provider. Tiers: economy (fast), standard (default), high (complex reasoning), max (deepest analysis). Providers: anthropic, openai, google, deepseek.",
+        ),
     ];
     tool_descs.push((
         "cron_add",
@@ -1277,6 +1281,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
+        ("set_model_preference", "Switch AI model. Use when task needs more reasoning power."),
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];

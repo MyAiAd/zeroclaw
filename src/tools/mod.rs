@@ -19,6 +19,7 @@ pub mod image_info;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+pub mod model_preference;
 pub mod pushover;
 pub mod schedule;
 pub mod schema;
@@ -47,6 +48,7 @@ pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use model_preference::SetModelPreferenceTool;
 pub use pushover::PushoverTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -140,7 +142,8 @@ pub fn all_tools_with_runtime(
         Box::new(CronRunsTool::new(config.clone())),
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
-        Box::new(MemoryForgetTool::new(memory)),
+        Box::new(MemoryForgetTool::new(memory.clone())),
+        Box::new(SetModelPreferenceTool::new(memory)),
         Box::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Box::new(GitOperationsTool::new(
             security.clone(),
