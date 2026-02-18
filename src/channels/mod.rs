@@ -33,6 +33,7 @@ pub use whatsapp::WhatsAppChannel;
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
 use crate::config::Config;
 use crate::identity;
+use crate::mcp::McpManager;
 use crate::memory::{self, Memory};
 use crate::model_router::{
     detect_model_switch_regex, extract_clean_message, generate_switch_notification,
@@ -52,6 +53,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
@@ -76,6 +78,8 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    /// MCP manager for channel tool dispatch; None in tests or when MCP is disabled.
+    mcp_manager: Option<Arc<Mutex<McpManager>>>,
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -90,7 +94,10 @@ fn model_pref_key(session_id: &str) -> String {
 }
 
 /// Get the current model preference for a session from memory.
-async fn get_model_preference_local(memory: &dyn Memory, session_id: &str) -> Option<ModelPreference> {
+async fn get_model_preference_local(
+    memory: &dyn Memory,
+    session_id: &str,
+) -> Option<ModelPreference> {
     let key = model_pref_key(session_id);
     match memory.get(&key).await {
         Ok(Some(entry)) => serde_json::from_str(&entry.content).ok(),
@@ -424,10 +431,20 @@ async fn process_channel_message_inner(
         (model_id, Some(notif), switch_only, cleaned)
     } else if let Some(pref) = &session_pref {
         // Use existing session preference
-        (pref.model_id.clone(), None, false, Some(msg.content.clone()))
+        (
+            pref.model_id.clone(),
+            None,
+            false,
+            Some(msg.content.clone()),
+        )
     } else {
         // Use default model
-        (ctx.model.to_string(), None, false, Some(msg.content.clone()))
+        (
+            ctx.model.to_string(),
+            None,
+            false,
+            Some(msg.content.clone()),
+        )
     };
 
     // Handle switch-only command (no question to answer)
@@ -474,16 +491,22 @@ async fn process_channel_message_inner(
         }
     }
 
-    println!(
-        "  ⏳ Processing message (model: {})...",
-        effective_model
-    );
+    println!("  ⏳ Processing message (model: {})...", effective_model);
     let started_at = Instant::now();
 
     let mut history = vec![
         ChatMessage::system(ctx.system_prompt.as_str()),
         ChatMessage::user(&enriched_message),
     ];
+
+    // Inject session context so set_model_preference tool and LLM know the session_id
+    let session_context = format!(
+        "Session: session_id=\"{session_id}\", channel=\"{}\", user=\"{}\"\n\
+         You are responding on the {} channel. Your response is sent directly to the user.\n\
+         When calling set_model_preference, use this session_id exactly.",
+        msg.channel, msg.sender, msg.channel
+    );
+    history.insert(1, ChatMessage::system(&session_context));
 
     if let Some(instructions) = channel_delivery_instructions(&msg.channel) {
         history.push(ChatMessage::system(instructions));
@@ -502,6 +525,7 @@ async fn process_channel_message_inner(
             true, // silent — channels don't write to stdout
             None,
             msg.channel.as_str(),
+            ctx.mcp_manager.clone(),
         ),
     )
     .await;
@@ -517,7 +541,9 @@ async fn process_channel_message_inner(
             // ── AI-initiated model switch detection (US-019) ──────────────
             // Check if the AI called set_model_preference during this turn
             if rerun_count < MAX_MODEL_SWITCH_RERUNS {
-                if let Some(new_pref) = get_model_preference_local(ctx.memory.as_ref(), &session_id).await {
+                if let Some(new_pref) =
+                    get_model_preference_local(ctx.memory.as_ref(), &session_id).await
+                {
                     // Check if this was set by AI and is different from what we just used
                     if new_pref.set_by == "ai" && new_pref.model_id != effective_model {
                         println!(
@@ -527,12 +553,8 @@ async fn process_channel_message_inner(
                             MAX_MODEL_SWITCH_RERUNS
                         );
                         // Re-run with the new model
-                        return Box::pin(process_channel_message_inner(
-                            ctx,
-                            msg,
-                            rerun_count + 1,
-                        ))
-                        .await;
+                        return Box::pin(process_channel_message_inner(ctx, msg, rerun_count + 1))
+                            .await;
                     }
                 }
             }
@@ -731,7 +753,9 @@ pub fn build_system_prompt(
 
     // ── 1d. Self-Escalation (US-021) ─────────────────────────────
     // Only add if set_model_preference tool is available
-    let has_model_preference_tool = tools.iter().any(|(name, _)| *name == "set_model_preference");
+    let has_model_preference_tool = tools
+        .iter()
+        .any(|(name, _)| *name == "set_model_preference");
     if has_model_preference_tool {
         prompt.push_str(
             "## Model Self-Escalation\n\n\
@@ -742,10 +766,10 @@ pub fn build_system_prompt(
              - Tasks requiring deep domain expertise\n\
              - User explicitly asks for your \"best\" or most thorough analysis\n\n\
              **How to escalate:**\n\
-             Use the `set_model_preference` tool with tier='high' or tier='max':\n\
+             Use the `set_model_preference` tool with the session_id from your Session context (session_id=\"...\"), and tier='high' or tier='max':\n\
              ```\n\
              <tool_call>\n\
-             {\"name\": \"set_model_preference\", \"arguments\": {\"session_id\": \"<current_session>\", \"tier\": \"high\", \"reason\": \"Complex reasoning task\"}}\n\
+             {\"name\": \"set_model_preference\", \"arguments\": {\"session_id\": \"<use session_id from Session context>\", \"tier\": \"high\", \"reason\": \"Complex reasoning task\"}}\n\
              </tool_call>\n\
              ```\n\n\
              **Important:** Only escalate when genuinely needed. Most tasks work well at standard tier. \
@@ -855,10 +879,9 @@ pub fn build_system_prompt(
     // ── 8. Channel Capabilities ─────────────────────────────────────
     prompt.push_str("## Channel Capabilities\n\n");
     prompt.push_str(
-        "- You are running as a Discord bot. You CAN and do send messages to Discord channels.\n",
+        "- You are running as a channel bot (Telegram, Discord, or other). You CAN and do send messages to the channel.\n",
     );
-    prompt.push_str("- When someone messages you on Discord, your response is automatically sent back to Discord.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+    prompt.push_str("- When someone messages you, your response is automatically sent back. You do NOT need to ask permission — just respond directly.\n");
     prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
     prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n");
 
@@ -1602,6 +1625,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    let mcp_manager = Arc::new(Mutex::new(McpManager::from_config_any(&config.mcp).await));
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1612,6 +1637,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        mcp_manager: Some(Arc::clone(&mcp_manager)),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1620,6 +1646,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     for h in handles {
         let _ = h.await;
     }
+
+    // Shutdown MCP servers
+    let mut guard: tokio::sync::MutexGuard<'_, McpManager> = mcp_manager.lock().await;
+    guard.shutdown().await;
 
     Ok(())
 }
@@ -1836,6 +1866,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            mcp_manager: None,
         });
 
         process_channel_message(
@@ -1877,6 +1908,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            mcp_manager: None,
         });
 
         process_channel_message(
@@ -1972,6 +2004,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            mcp_manager: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -2229,8 +2262,8 @@ mod tests {
             "missing Channel Capabilities section"
         );
         assert!(
-            prompt.contains("running as a Discord bot"),
-            "missing Discord context"
+            prompt.contains("channel") && prompt.contains("bot"),
+            "missing channel bot context"
         );
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),

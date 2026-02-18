@@ -9,18 +9,13 @@ use std::sync::LazyLock;
 use crate::model_tiers::{resolve_provider_alias, ModelProvider, ModelTier};
 
 /// Persistence mode for model switches
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SwitchPersistence {
     /// Keep this model for the rest of the session
+    #[default]
     Sticky,
     /// Only use this model for the current message
     OneShot,
-}
-
-impl Default for SwitchPersistence {
-    fn default() -> Self {
-        Self::Sticky
-    }
 }
 
 /// Result of regex-based model switch detection
@@ -35,7 +30,7 @@ pub struct RegexDetectionResult {
 
 // Regex patterns for model switch detection
 static PROVIDER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:use|switch\s+to|try)\s+(claude|gpt|openai|anthropic|gemini|deepseek)\b")
+    Regex::new(r"(?i)\b(?:use|switch\s+to|change\s+to|swap\s+to|move\s+to|try)(?:\s+\w+){0,4}?\s+(claude|gpt|openai|anthropic|gemini|deepseek)\b")
         .expect("Invalid provider pattern")
 });
 
@@ -65,21 +60,23 @@ static MAX_TIER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static HIGH_TIER_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:think\s+harder|smarter|more\s+reasoning|deep(?:er)?)\b")
+    Regex::new(r"(?i)\b(?:think\s+harder|smarter|higher|better|more\s+(?:powerful|reasoning|advanced)|deep(?:er)?)\b")
         .expect("Invalid high tier pattern")
 });
 
 /// Patterns to strip from messages when extracting the clean question
 static STRIP_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
-        Regex::new(r"(?i)\b(?:use|switch\s+to|try)\s+(?:claude|gpt|openai|anthropic|gemini|deepseek)\s*").unwrap(),
+        Regex::new(r"(?i)\b(?:use|switch\s+to|change\s+to|swap\s+to|move\s+to|try)(?:\s+\w+){0,4}?\s+(?:claude|gpt|openai|anthropic|gemini|deepseek)\s*").unwrap(),
         Regex::new(r"(?i)\b(?:think\s+harder|smarter\s+model|more\s+reasoning|deep(?:er)?\s+analysis)\s*").unwrap(),
+        Regex::new(r"(?i)\b(?:higher|better|more\s+(?:powerful|advanced))\s+(?:model|tier)?\s*").unwrap(),
         Regex::new(r"(?i)\b(?:quick(?:er)?\s+(?:answer|response)|simpler\s+model|cheaper|faster)\s*").unwrap(),
         Regex::new(r"(?i)\b(?:from\s+now\s+on|for\s+(?:the\s+)?rest|going\s+forward)\s*").unwrap(),
         Regex::new(r"(?i)\b(?:just\s+(?:for\s+)?this|only\s+this\s+(?:one|time))\s*").unwrap(),
         Regex::new(r"(?i)\b(?:your\s+(?:very\s+)?(?:best|smartest|strongest)|absolute\s+best|maximum|strongest)\s*").unwrap(),
         Regex::new(r"(?i)\bplease\s+use\s+a?\s*").unwrap(),
-        Regex::new(r"(?i)\bcan\s+you\s+use\s*").unwrap(),
+        Regex::new(r"(?i)\bcan\s+you\s+(?:use\s*|switch\s+to\s*)").unwrap(),
+        Regex::new(r"(?i)\b(?:a\s+)?model\s+from\s+").unwrap(),
         Regex::new(r"(?i)\bto\s+(?:explain|analyze|help)").unwrap(),
     ]
 });
@@ -99,7 +96,10 @@ pub fn detect_model_switch_regex(message: &str) -> Option<RegexDetectionResult> 
         if let Some(raw) = raw_provider {
             provider = resolve_provider_alias(&raw);
             matched_pattern = "provider".to_string();
-            matched_text = caps.get(0).map(|m| m.as_str().to_string()).unwrap_or_default();
+            matched_text = caps
+                .get(0)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
         }
     }
 
@@ -383,7 +383,8 @@ mod tests {
         assert_eq!(cleaned, "quantum physics");
 
         // Simple provider switch with question
-        let cleaned2 = extract_clean_message("switch to gpt what is the capital of France?").unwrap();
+        let cleaned2 =
+            extract_clean_message("switch to gpt what is the capital of France?").unwrap();
         assert_eq!(cleaned2, "what is the capital of France?");
     }
 
@@ -395,7 +396,8 @@ mod tests {
 
     #[test]
     fn generate_notification_sticky() {
-        let notif = generate_switch_notification("Claude Opus 4.5", SwitchPersistence::Sticky, "user");
+        let notif =
+            generate_switch_notification("Claude Opus 4.5", SwitchPersistence::Sticky, "user");
         assert!(notif.contains("Now using Claude Opus 4.5 for this session"));
     }
 
@@ -407,7 +409,8 @@ mod tests {
 
     #[test]
     fn generate_notification_ai_escalation() {
-        let notif = generate_switch_notification("Claude Opus 4.5", SwitchPersistence::Sticky, "ai");
+        let notif =
+            generate_switch_notification("Claude Opus 4.5", SwitchPersistence::Sticky, "ai");
         assert!(notif.contains("Escalated to Claude Opus 4.5 for complex reasoning"));
     }
 
@@ -436,7 +439,8 @@ mod tests {
     #[test]
     fn parity_03_switch_to_gpt_for_rest() {
         // "Switch to GPT for the rest" → openai, sticky
-        let result = detect_model_switch_regex("Switch to GPT for the rest of our conversation").unwrap();
+        let result =
+            detect_model_switch_regex("Switch to GPT for the rest of our conversation").unwrap();
         assert_eq!(result.provider, Some(ModelProvider::OpenAI));
         assert_eq!(result.persistence, SwitchPersistence::Sticky);
     }
@@ -501,7 +505,10 @@ mod tests {
         assert_eq!(ModelTier::from_str("eco").unwrap(), ModelTier::Economy);
         assert_eq!(ModelTier::from_str("cheap").unwrap(), ModelTier::Economy);
         assert_eq!(ModelTier::from_str("fast").unwrap(), ModelTier::Economy);
-        assert_eq!(ModelTier::from_str("standard").unwrap(), ModelTier::Standard);
+        assert_eq!(
+            ModelTier::from_str("standard").unwrap(),
+            ModelTier::Standard
+        );
         assert_eq!(ModelTier::from_str("std").unwrap(), ModelTier::Standard);
         assert_eq!(ModelTier::from_str("high").unwrap(), ModelTier::High);
         assert_eq!(ModelTier::from_str("smart").unwrap(), ModelTier::High);
@@ -511,13 +518,62 @@ mod tests {
 
     #[test]
     fn model_provider_from_str_aliases() {
-        assert_eq!(ModelProvider::from_str("anthropic").unwrap(), ModelProvider::Anthropic);
-        assert_eq!(ModelProvider::from_str("claude").unwrap(), ModelProvider::Anthropic);
-        assert_eq!(ModelProvider::from_str("openai").unwrap(), ModelProvider::OpenAI);
-        assert_eq!(ModelProvider::from_str("gpt").unwrap(), ModelProvider::OpenAI);
-        assert_eq!(ModelProvider::from_str("chatgpt").unwrap(), ModelProvider::OpenAI);
-        assert_eq!(ModelProvider::from_str("google").unwrap(), ModelProvider::Google);
-        assert_eq!(ModelProvider::from_str("gemini").unwrap(), ModelProvider::Google);
-        assert_eq!(ModelProvider::from_str("deepseek").unwrap(), ModelProvider::DeepSeek);
+        assert_eq!(
+            ModelProvider::from_str("anthropic").unwrap(),
+            ModelProvider::Anthropic
+        );
+        assert_eq!(
+            ModelProvider::from_str("claude").unwrap(),
+            ModelProvider::Anthropic
+        );
+        assert_eq!(
+            ModelProvider::from_str("openai").unwrap(),
+            ModelProvider::OpenAI
+        );
+        assert_eq!(
+            ModelProvider::from_str("gpt").unwrap(),
+            ModelProvider::OpenAI
+        );
+        assert_eq!(
+            ModelProvider::from_str("chatgpt").unwrap(),
+            ModelProvider::OpenAI
+        );
+        assert_eq!(
+            ModelProvider::from_str("google").unwrap(),
+            ModelProvider::Google
+        );
+        assert_eq!(
+            ModelProvider::from_str("gemini").unwrap(),
+            ModelProvider::Google
+        );
+        assert_eq!(
+            ModelProvider::from_str("deepseek").unwrap(),
+            ModelProvider::DeepSeek
+        );
+    }
+
+    // Expanded natural-language detection (Bug A fix)
+    #[test]
+    fn detect_switch_to_higher_model() {
+        let result = detect_model_switch_regex("Can you switch to a higher model ?").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::High));
+    }
+
+    #[test]
+    fn detect_change_to_model_from_claude() {
+        let result = detect_model_switch_regex("Please change to a model from Claude").unwrap();
+        assert_eq!(result.provider, Some(ModelProvider::Anthropic));
+    }
+
+    #[test]
+    fn detect_change_to_claude() {
+        let result = detect_model_switch_regex("change to Claude for this").unwrap();
+        assert_eq!(result.provider, Some(ModelProvider::Anthropic));
+    }
+
+    #[test]
+    fn detect_better_model() {
+        let result = detect_model_switch_regex("use a better model").unwrap();
+        assert_eq!(result.tier, Some(ModelTier::High));
     }
 }

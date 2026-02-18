@@ -79,7 +79,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
+                Box::pin(crate::cron::scheduler::run(cfg))
             },
         ));
     } else {

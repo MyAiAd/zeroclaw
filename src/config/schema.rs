@@ -8,6 +8,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+fn default_true() -> bool {
+    true
+}
+
 // ── Top-level config ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +97,45 @@ pub struct Config {
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// MCP (Model Context Protocol) servers — external tools.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+// ── MCP Config (US-012) ─────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
+    /// For stdio: command to spawn
+    #[serde(default)]
+    pub command: Option<String>,
+    /// For stdio: arguments to the command
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// For http: URL of the MCP server
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Environment variables for the spawned process (stdio only)
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Whether this server is active
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    Stdio,
+    Http,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -502,10 +545,6 @@ fn default_webhook_rate_limit() -> u32 {
 
 fn default_idempotency_ttl_secs() -> u64 {
     300
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Default for GatewayConfig {
@@ -1700,6 +1739,7 @@ impl Default for Config {
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -2047,6 +2087,17 @@ impl Config {
                 }
             }
         }
+
+        // MCP servers: ZEROCLAW_MCP_SERVERS (JSON with "servers" object)
+        if let Ok(mcp_json) = std::env::var("ZEROCLAW_MCP_SERVERS") {
+            if let Ok(mcp_config) = serde_json::from_str::<McpConfig>(&mcp_json) {
+                self.mcp = mcp_config;
+            } else {
+                tracing::warn!(
+                    "Failed to parse ZEROCLAW_MCP_SERVERS JSON, using config file values"
+                );
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
@@ -2338,6 +2389,7 @@ default_temperature = 0.7
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -2447,6 +2499,7 @@ tool_dispatcher = "xml"
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
+            mcp: McpConfig::default(),
         };
 
         config.save().unwrap();
@@ -3188,6 +3241,39 @@ default_temperature = 0.7
         let parsed: Config = toml::from_str(minimal).unwrap();
         assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
+    }
+
+    #[test]
+    fn mcp_config_deserialize_toml() {
+        let toml_str = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[mcp.servers.filesystem]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+enabled = true
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.mcp.servers.len(), 1);
+        let fs = parsed.mcp.servers.get("filesystem").unwrap();
+        assert!(matches!(fs.transport, McpTransport::Stdio));
+        assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(fs.args.len(), 3);
+        assert!(fs.enabled);
+    }
+
+    #[test]
+    fn mcp_config_default_empty() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert!(parsed.mcp.servers.is_empty());
     }
 
     // ── Environment variable overrides (Docker support) ─────────

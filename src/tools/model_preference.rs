@@ -193,7 +193,8 @@ impl Tool for SetModelPreferenceTool {
 
                 // Add fallback note if we had to use a different tier
                 if let Some(note) = fallback_note {
-                    output.push_str(&format!("\n{}", note));
+                    let _ = std::fmt::Write::write_str(&mut output, "\n");
+                    let _ = std::fmt::Write::write_str(&mut output, &note);
                 }
 
                 Ok(ToolResult {
@@ -296,9 +297,7 @@ mod tests {
     async fn set_preference_missing_tier() {
         let (_tmp, mem) = test_mem();
         let tool = SetModelPreferenceTool::new(mem);
-        let result = tool
-            .execute(json!({"session_id": "test-session"}))
-            .await;
+        let result = tool.execute(json!({"session_id": "test-session"})).await;
         assert!(result.is_err());
     }
 

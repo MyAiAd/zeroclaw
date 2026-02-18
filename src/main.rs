@@ -55,6 +55,9 @@ mod identity;
 mod integrations;
 mod memory;
 mod migration;
+mod mcp {
+    pub use zeroclaw::mcp::*;
+}
 mod model_router {
     pub use zeroclaw::model_router::*;
 }

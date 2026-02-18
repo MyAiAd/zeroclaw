@@ -96,118 +96,119 @@ pub static PROVIDER_ALIASES: LazyLock<HashMap<&'static str, ModelProvider>> = La
 });
 
 /// Model tier mappings
-pub static MODEL_TIERS: LazyLock<HashMap<(ModelProvider, ModelTier), ModelEntry>> = LazyLock::new(|| {
-    let mut m = HashMap::new();
+pub static MODEL_TIERS: LazyLock<HashMap<(ModelProvider, ModelTier), ModelEntry>> =
+    LazyLock::new(|| {
+        let mut m = HashMap::new();
 
-    // Economy tier
-    m.insert(
-        (ModelProvider::Anthropic, ModelTier::Economy),
-        ModelEntry {
-            provider: ModelProvider::Anthropic,
-            model_id: "anthropic/claude-haiku-4.5".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            cost_per_1m: 0.80,
-        },
-    );
-    m.insert(
-        (ModelProvider::OpenAI, ModelTier::Economy),
-        ModelEntry {
-            provider: ModelProvider::OpenAI,
-            model_id: "openai/o4-mini".to_string(),
-            display_name: "GPT-4o Mini".to_string(),
-            cost_per_1m: 1.20,
-        },
-    );
-    m.insert(
-        (ModelProvider::DeepSeek, ModelTier::Economy),
-        ModelEntry {
-            provider: ModelProvider::DeepSeek,
-            model_id: "deepseek/deepseek-v3.2".to_string(),
-            display_name: "DeepSeek V3.2".to_string(),
-            cost_per_1m: 0.14,
-        },
-    );
+        // Economy tier
+        m.insert(
+            (ModelProvider::Anthropic, ModelTier::Economy),
+            ModelEntry {
+                provider: ModelProvider::Anthropic,
+                model_id: "anthropic/claude-haiku-4.5".to_string(),
+                display_name: "Claude Haiku 4.5".to_string(),
+                cost_per_1m: 0.80,
+            },
+        );
+        m.insert(
+            (ModelProvider::OpenAI, ModelTier::Economy),
+            ModelEntry {
+                provider: ModelProvider::OpenAI,
+                model_id: "openai/o4-mini".to_string(),
+                display_name: "GPT-4o Mini".to_string(),
+                cost_per_1m: 1.20,
+            },
+        );
+        m.insert(
+            (ModelProvider::DeepSeek, ModelTier::Economy),
+            ModelEntry {
+                provider: ModelProvider::DeepSeek,
+                model_id: "deepseek/deepseek-v3.2".to_string(),
+                display_name: "DeepSeek V3.2".to_string(),
+                cost_per_1m: 0.14,
+            },
+        );
 
-    // Standard tier
-    m.insert(
-        (ModelProvider::Anthropic, ModelTier::Standard),
-        ModelEntry {
-            provider: ModelProvider::Anthropic,
-            model_id: "anthropic/claude-sonnet-4.5".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            cost_per_1m: 3.00,
-        },
-    );
-    m.insert(
-        (ModelProvider::OpenAI, ModelTier::Standard),
-        ModelEntry {
-            provider: ModelProvider::OpenAI,
-            model_id: "openai/gpt-4.1".to_string(),
-            display_name: "GPT-4.1".to_string(),
-            cost_per_1m: 2.00,
-        },
-    );
-    m.insert(
-        (ModelProvider::Google, ModelTier::Standard),
-        ModelEntry {
-            provider: ModelProvider::Google,
-            model_id: "google/gemini-2.5-flash".to_string(),
-            display_name: "Gemini 2.5 Flash".to_string(),
-            cost_per_1m: 0.75,
-        },
-    );
+        // Standard tier
+        m.insert(
+            (ModelProvider::Anthropic, ModelTier::Standard),
+            ModelEntry {
+                provider: ModelProvider::Anthropic,
+                model_id: "anthropic/claude-sonnet-4.5".to_string(),
+                display_name: "Claude Sonnet 4.5".to_string(),
+                cost_per_1m: 3.00,
+            },
+        );
+        m.insert(
+            (ModelProvider::OpenAI, ModelTier::Standard),
+            ModelEntry {
+                provider: ModelProvider::OpenAI,
+                model_id: "openai/gpt-4.1".to_string(),
+                display_name: "GPT-4.1".to_string(),
+                cost_per_1m: 2.00,
+            },
+        );
+        m.insert(
+            (ModelProvider::Google, ModelTier::Standard),
+            ModelEntry {
+                provider: ModelProvider::Google,
+                model_id: "google/gemini-2.5-flash".to_string(),
+                display_name: "Gemini 2.5 Flash".to_string(),
+                cost_per_1m: 0.75,
+            },
+        );
 
-    // High tier
-    m.insert(
-        (ModelProvider::Anthropic, ModelTier::High),
-        ModelEntry {
-            provider: ModelProvider::Anthropic,
-            model_id: "anthropic/claude-opus-4.5".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            cost_per_1m: 15.00,
-        },
-    );
-    m.insert(
-        (ModelProvider::OpenAI, ModelTier::High),
-        ModelEntry {
-            provider: ModelProvider::OpenAI,
-            model_id: "openai/o3".to_string(),
-            display_name: "o3".to_string(),
-            cost_per_1m: 15.00,
-        },
-    );
-    m.insert(
-        (ModelProvider::Google, ModelTier::High),
-        ModelEntry {
-            provider: ModelProvider::Google,
-            model_id: "google/gemini-3-pro-preview".to_string(),
-            display_name: "Gemini 3 Pro".to_string(),
-            cost_per_1m: 7.00,
-        },
-    );
+        // High tier
+        m.insert(
+            (ModelProvider::Anthropic, ModelTier::High),
+            ModelEntry {
+                provider: ModelProvider::Anthropic,
+                model_id: "anthropic/claude-opus-4.5".to_string(),
+                display_name: "Claude Opus 4.5".to_string(),
+                cost_per_1m: 15.00,
+            },
+        );
+        m.insert(
+            (ModelProvider::OpenAI, ModelTier::High),
+            ModelEntry {
+                provider: ModelProvider::OpenAI,
+                model_id: "openai/o3".to_string(),
+                display_name: "o3".to_string(),
+                cost_per_1m: 15.00,
+            },
+        );
+        m.insert(
+            (ModelProvider::Google, ModelTier::High),
+            ModelEntry {
+                provider: ModelProvider::Google,
+                model_id: "google/gemini-3-pro-preview".to_string(),
+                display_name: "Gemini 3 Pro".to_string(),
+                cost_per_1m: 7.00,
+            },
+        );
 
-    // Max tier
-    m.insert(
-        (ModelProvider::Anthropic, ModelTier::Max),
-        ModelEntry {
-            provider: ModelProvider::Anthropic,
-            model_id: "anthropic/claude-opus-4.6".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            cost_per_1m: 20.00,
-        },
-    );
-    m.insert(
-        (ModelProvider::OpenAI, ModelTier::Max),
-        ModelEntry {
-            provider: ModelProvider::OpenAI,
-            model_id: "openai/o3-pro".to_string(),
-            display_name: "o3 Pro".to_string(),
-            cost_per_1m: 60.00,
-        },
-    );
+        // Max tier
+        m.insert(
+            (ModelProvider::Anthropic, ModelTier::Max),
+            ModelEntry {
+                provider: ModelProvider::Anthropic,
+                model_id: "anthropic/claude-opus-4.6".to_string(),
+                display_name: "Claude Opus 4.6".to_string(),
+                cost_per_1m: 20.00,
+            },
+        );
+        m.insert(
+            (ModelProvider::OpenAI, ModelTier::Max),
+            ModelEntry {
+                provider: ModelProvider::OpenAI,
+                model_id: "openai/o3-pro".to_string(),
+                display_name: "o3 Pro".to_string(),
+                cost_per_1m: 60.00,
+            },
+        );
 
-    m
-});
+        m
+    });
 
 /// Get the model entry for a given provider and tier.
 /// Returns None if the combination is not available.
@@ -272,7 +273,10 @@ mod tests {
         assert_eq!(ModelTier::Max.to_string(), "max");
 
         assert_eq!(ModelTier::from_str("economy").unwrap(), ModelTier::Economy);
-        assert_eq!(ModelTier::from_str("STANDARD").unwrap(), ModelTier::Standard);
+        assert_eq!(
+            ModelTier::from_str("STANDARD").unwrap(),
+            ModelTier::Standard
+        );
         assert_eq!(ModelTier::from_str("high").unwrap(), ModelTier::High);
         assert_eq!(ModelTier::from_str("max").unwrap(), ModelTier::Max);
 

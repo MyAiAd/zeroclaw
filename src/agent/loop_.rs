@@ -1,5 +1,6 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
+use crate::mcp::McpManager;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::providers::{self, ChatMessage, Provider, ToolCall};
@@ -13,6 +14,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
@@ -540,6 +542,7 @@ pub(crate) async fn agent_turn(
         silent,
         None,
         "channel",
+        None,
     )
     .await
 }
@@ -558,11 +561,20 @@ pub(crate) async fn run_tool_call_loop(
     silent: bool,
     approval: Option<&ApprovalManager>,
     channel_name: &str,
+    mcp_manager: Option<Arc<Mutex<McpManager>>>,
 ) -> Result<String> {
     // Build native tool definitions once if the provider supports them.
-    let use_native_tools = provider.supports_native_tools() && !tools_registry.is_empty();
+    let has_builtin = !tools_registry.is_empty();
+    let has_mcp = mcp_manager.is_some();
+    let use_native_tools = provider.supports_native_tools() && (has_builtin || has_mcp);
+
     let tool_definitions = if use_native_tools {
-        tools_to_openai_format(tools_registry)
+        let mut defs = tools_to_openai_format(tools_registry);
+        if let Some(ref mcp) = mcp_manager {
+            let guard: tokio::sync::MutexGuard<'_, McpManager> = mcp.lock().await;
+            defs.extend(guard.tool_definitions_openai());
+        }
+        defs
     } else {
         Vec::new()
     };
@@ -713,7 +725,61 @@ pub(crate) async fn run_tool_call_loop(
                 tool: call.name.clone(),
             });
             let start = Instant::now();
-            let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
+            let result = if let Some(ref mcp) = mcp_manager {
+                let mut guard: tokio::sync::MutexGuard<'_, McpManager> = mcp.lock().await;
+                if guard.is_mcp_tool(&call.name) {
+                    match guard.call_tool(&call.name, call.arguments.clone()).await {
+                        Ok(r) => {
+                            observer.record_event(&ObserverEvent::ToolCall {
+                                tool: call.name.clone(),
+                                duration: start.elapsed(),
+                                success: r.success,
+                            });
+                            if r.success {
+                                scrub_credentials(&r.output)
+                            } else {
+                                format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                            }
+                        }
+                        Err(e) => {
+                            observer.record_event(&ObserverEvent::ToolCall {
+                                tool: call.name.clone(),
+                                duration: start.elapsed(),
+                                success: false,
+                            });
+                            format!("Error executing {}: {e}", call.name)
+                        }
+                    }
+                } else {
+                    drop(guard);
+                    if let Some(tool) = find_tool(tools_registry, &call.name) {
+                        match tool.execute(call.arguments.clone()).await {
+                            Ok(r) => {
+                                observer.record_event(&ObserverEvent::ToolCall {
+                                    tool: call.name.clone(),
+                                    duration: start.elapsed(),
+                                    success: r.success,
+                                });
+                                if r.success {
+                                    scrub_credentials(&r.output)
+                                } else {
+                                    format!("Error: {}", r.error.unwrap_or_else(|| r.output))
+                                }
+                            }
+                            Err(e) => {
+                                observer.record_event(&ObserverEvent::ToolCall {
+                                    tool: call.name.clone(),
+                                    duration: start.elapsed(),
+                                    success: false,
+                                });
+                                format!("Error executing {}: {e}", call.name)
+                            }
+                        }
+                    } else {
+                        format!("Unknown tool: {}", call.name)
+                    }
+                }
+            } else if let Some(tool) = find_tool(tools_registry, &call.name) {
                 match tool.execute(call.arguments.clone()).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
@@ -1070,6 +1136,7 @@ pub async fn run(
             false,
             Some(&approval_manager),
             "cli",
+            None,
         )
         .await?;
         final_output = response.clone();
@@ -1149,6 +1216,7 @@ pub async fn run(
                 false,
                 Some(&approval_manager),
                 "cli",
+                None,
             )
             .await
             {
@@ -1281,7 +1349,10 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
-        ("set_model_preference", "Switch AI model. Use when task needs more reasoning power."),
+        (
+            "set_model_preference",
+            "Switch AI model. Use when task needs more reasoning power.",
+        ),
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
